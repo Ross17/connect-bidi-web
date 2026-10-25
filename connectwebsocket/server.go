@@ -13,7 +13,8 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: read limit (WithMaxFrameBytes),
-// stream cap (WithMaxStreams), increasing IDs (WithIncreasingStreamIDs).
+// stream cap (WithMaxStreams), increasing IDs (WithIncreasingStreamIDs),
+// slow-consumer reset (WithDeliverTimeout).
 
 package connectwebsocket
 
@@ -101,6 +102,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if flag == bidiprotocol.FlagEnvelopeReset {
 			mc.deregister(streamID)
 			stream.terminate(context.Canceled)
+			continue
+		}
+		if h.opts.deliverTimeout > 0 {
+			if !stream.deliverWithin(flag, payload, h.opts.deliverTimeout) {
+				slog.DebugContext(ctx, "bidi server: stream consumer too slow, resetting", "stream_id", streamID)
+				mc.deregister(streamID)
+				stream.terminate(errDeliverTimeout)
+				_ = mc.writeFrame(streamID, bidiprotocol.FlagEnvelopeReset, nil)
+			}
 			continue
 		}
 		stream.deliver(flag, payload)

@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: added WithMaxFrameBytes, WithMaxStreams,
-// WithIncreasingStreamIDs.
+// WithIncreasingStreamIDs, WithDeliverTimeout.
 
 // Package connectwebsocket provides a connect.Transport and an http.Handler
 // that carry Connect RPCs over WebSocket connections, enabling full
@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"connectrpc.com/connect/v2"
 	"github.com/coder/websocket"
@@ -62,6 +63,10 @@ type serverOptions struct {
 	// increasingStreamIDs requires each new stream ID to be greater than
 	// every earlier one on the connection.
 	increasingStreamIDs bool
+
+	// deliverTimeout bounds how long the read loop waits for one stream's
+	// consumer; 0 or less keeps the upstream behaviour (wait forever).
+	deliverTimeout time.Duration
 }
 
 type optionFunc func(*transportOptions, *serverOptions)
@@ -176,6 +181,23 @@ func WithIncreasingStreamIDs() Option {
 	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
 		if sopts != nil {
 			sopts.increasingStreamIDs = true
+		}
+	})
+}
+
+// WithDeliverTimeout bounds how long the handler's read loop waits for one
+// stream's handler to accept a frame. Without it, a handler that stops
+// reading blocks the read loop, which stalls every other stream on the
+// connection, including their reset frames (head-of-line blocking). With
+// it, a stream whose inbox stays full for longer than d is reset: the
+// handler's context is canceled with a resource-exhausted error, a reset
+// frame is sent to the client, and the read loop carries on. A value of 0
+// or less means wait forever, which is the default. It applies to
+// NewHandler only.
+func WithDeliverTimeout(d time.Duration) Option {
+	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
+		if sopts != nil {
+			sopts.deliverTimeout = d
 		}
 	})
 }

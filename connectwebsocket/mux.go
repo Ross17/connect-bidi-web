@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified by the RossB project, 2026: stream count for WithMaxStreams.
+// Modified by the RossB project, 2026: stream count for WithMaxStreams,
+// bounded delivery for WithDeliverTimeout.
 
 package connectwebsocket
 
@@ -25,6 +26,7 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"connectrpc.com/connect/v2"
 	"github.com/coder/websocket"
@@ -50,6 +52,8 @@ const (
 var (
 	errConnClosed   = errors.New("websocket connection closed")
 	errStreamClosed = errors.New("websocket stream closed")
+	// errDeliverTimeout ends a stream whose consumer stopped reading.
+	errDeliverTimeout = connect.NewError(connect.CodeResourceExhausted, "websocket stream consumer too slow")
 )
 
 // writeFrame writes one WebSocket message carrying one envelope for one
@@ -310,6 +314,31 @@ func (s *muxStream) deliver(flag uint8, payload []byte) {
 	select {
 	case s.inbox <- envelope{flag: flag, payload: payload}:
 	case <-s.terminated:
+	}
+}
+
+// deliverWithin is deliver with a bound: it reports false if the consumer
+// did not accept the frame within d. A frame for a terminated stream is
+// dropped and reported as delivered, as in deliver. The timer is only
+// created when the inbox is full, so the common path does not allocate.
+func (s *muxStream) deliverWithin(flag uint8, payload []byte, d time.Duration) bool {
+	env := envelope{flag: flag, payload: payload}
+	select {
+	case s.inbox <- env:
+		return true
+	case <-s.terminated:
+		return true
+	default:
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case s.inbox <- env:
+		return true
+	case <-s.terminated:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
