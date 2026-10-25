@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified by the RossB project, 2026: added WithMaxFrameBytes.
+// Modified by the RossB project, 2026: added WithMaxFrameBytes, WithMaxStreams.
 
 // Package connectwebsocket provides a connect.Transport and an http.Handler
 // that carry Connect RPCs over WebSocket connections, enabling full
@@ -53,6 +53,10 @@ type serverOptions struct {
 	// maxFrameBytes bounds each WebSocket message the server reads; 0 or
 	// less keeps the upstream behaviour (no limit).
 	maxFrameBytes int64
+
+	// maxStreams bounds concurrent streams per connection; 0 or less keeps
+	// the upstream behaviour (no limit).
+	maxStreams int
 }
 
 type optionFunc func(*transportOptions, *serverOptions)
@@ -138,6 +142,20 @@ func WithMaxFrameBytes(maxBytes int64) Option {
 	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
 		if sopts != nil {
 			sopts.maxFrameBytes = maxBytes
+		}
+	})
+}
+
+// WithMaxStreams limits how many streams may be open at once on one
+// WebSocket connection. A headers frame that would open one more stream
+// closes the whole connection with status 1008 (policy violation); a
+// well-behaved client never exceeds the limit it was configured for. A
+// value of 0 or less means no limit, which is the default. It applies to
+// NewHandler only.
+func WithMaxStreams(maxStreams int) Option {
+	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
+		if sopts != nil {
+			sopts.maxStreams = maxStreams
 		}
 	})
 }

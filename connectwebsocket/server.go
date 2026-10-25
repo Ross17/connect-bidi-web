@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified by the RossB project, 2026: read limit (WithMaxFrameBytes).
+// Modified by the RossB project, 2026: read limit (WithMaxFrameBytes),
+// stream cap (WithMaxStreams).
 
 package connectwebsocket
 
@@ -67,6 +68,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	mc := newMuxConn(ctx, conn)
 	var handlers sync.WaitGroup
+	closeStatus := websocket.StatusNormalClosure
 	for {
 		streamID, flag, payload, err := readFrame(ctx, conn)
 		if err != nil {
@@ -78,6 +80,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if flag != bidiprotocol.FlagEnvelopeHeaders {
 				// A frame for a stream that already finished; drop it.
 				continue
+			}
+			if h.opts.maxStreams > 0 && mc.count() >= h.opts.maxStreams {
+				slog.DebugContext(ctx, "bidi server: stream limit reached", "limit", h.opts.maxStreams)
+				closeStatus = websocket.StatusPolicyViolation
+				break
 			}
 			h.startStream(ctx, mc, streamID, payload, &handlers, r.RemoteAddr)
 			continue
@@ -91,7 +98,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	mc.terminateAll(errConnClosed)
 	handlers.Wait()
-	_ = conn.Close(websocket.StatusNormalClosure, "")
+	_ = conn.Close(closeStatus, "")
 }
 
 // startStream registers a new stream and dispatches its RPC on its own

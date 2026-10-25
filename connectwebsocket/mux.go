@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the RossB project, 2026: stream count for WithMaxStreams.
 
 package connectwebsocket
 
@@ -172,6 +174,13 @@ func (mc *muxConn) deregister(streamID uint32) {
 	mc.mu.Lock()
 	delete(mc.streams, streamID)
 	mc.mu.Unlock()
+}
+
+// count reports how many streams are registered.
+func (mc *muxConn) count() int {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return len(mc.streams)
 }
 
 func (mc *muxConn) lookup(streamID uint32) *muxStream {
