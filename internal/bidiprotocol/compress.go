@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the RossB project, 2026: decompressed size limit.
 
 package bidiprotocol
 
@@ -37,15 +39,26 @@ func compress(compressor connect.Compressor, payload []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func decompress(compressor connect.Compressor, payload []byte) ([]byte, error) {
+// decompress inflates payload. When maxBytes is positive, at most
+// maxBytes+1 bytes are ever read from the decompressor, so a small
+// compressed message cannot expand to an unbounded one in memory; more than
+// maxBytes decompressed bytes is a resource-exhausted error.
+func decompress(compressor connect.Compressor, payload []byte, maxBytes int) ([]byte, error) {
 	reader, err := compressor.Decompress(bytes.NewReader(payload))
 	if err != nil {
 		return nil, connect.Errorf(connect.CodeInternal, "failed to decompress message: %v", err)
 	}
-	decompressed, err := io.ReadAll(reader)
+	var src io.Reader = reader
+	if maxBytes > 0 {
+		src = io.LimitReader(reader, int64(maxBytes)+1)
+	}
+	decompressed, err := io.ReadAll(src)
 	_ = reader.Close()
 	if err != nil {
 		return nil, connect.Errorf(connect.CodeInternal, "failed to read decompressed message: %v", err)
+	}
+	if maxBytes > 0 && len(decompressed) > maxBytes {
+		return nil, connect.Errorf(connect.CodeResourceExhausted, "decompressed message exceeds read limit %d", maxBytes)
 	}
 	return decompressed, nil
 }

@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the RossB project, 2026: ReadMaxBytes also bounds the decompressed size.
 
 package bidiprotocol
 
@@ -207,7 +209,7 @@ func (cs *ClientStream) Receive(msg any) error {
 		if compressor == nil {
 			return connect.Errorf(connect.CodeInternal, "protocol error: compressed message without Connect-Content-Encoding")
 		}
-		decompressed, err := decompress(compressor, payload)
+		decompressed, err := decompress(compressor, payload, cs.opts.ReadMaxBytes)
 		if err != nil {
 			return err
 		}
