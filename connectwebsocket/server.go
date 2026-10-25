@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the RossB project, 2026: read limit (WithMaxFrameBytes).
 
 package connectwebsocket
 
@@ -56,7 +58,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	conn.SetReadLimit(-1)
+	if h.opts.maxFrameBytes > 0 {
+		conn.SetReadLimit(h.opts.maxFrameBytes)
+	} else {
+		conn.SetReadLimit(-1)
+	}
 
 	ctx := r.Context()
 	mc := newMuxConn(ctx, conn)

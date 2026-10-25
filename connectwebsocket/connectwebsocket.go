@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the RossB project, 2026: added WithMaxFrameBytes.
 
 // Package connectwebsocket provides a connect.Transport and an http.Handler
 // that carry Connect RPCs over WebSocket connections, enabling full
@@ -47,6 +49,10 @@ type serverOptions struct {
 	bidiprotocol.Options
 
 	acceptOptions *websocket.AcceptOptions
+
+	// maxFrameBytes bounds each WebSocket message the server reads; 0 or
+	// less keeps the upstream behaviour (no limit).
+	maxFrameBytes int64
 }
 
 type optionFunc func(*transportOptions, *serverOptions)
@@ -117,6 +123,21 @@ func WithSendMaxBytes(maxBytes int) Option {
 		}
 		if sopts != nil {
 			sopts.SendMaxBytes = maxBytes
+		}
+	})
+}
+
+// WithMaxFrameBytes limits the size of each WebSocket message the handler
+// reads, including the 9-byte frame head (stream ID and envelope head). The
+// limit is enforced by the WebSocket library while the message is being
+// read, so an oversized message is never fully buffered: the connection is
+// closed with status 1009 (message too big). WithReadMaxBytes, by contrast,
+// is checked only after a whole message is in memory. A value of 0 or less
+// means no limit, which is the default. It applies to NewHandler only.
+func WithMaxFrameBytes(maxBytes int64) Option {
+	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
+		if sopts != nil {
+			sopts.maxFrameBytes = maxBytes
 		}
 	})
 }
