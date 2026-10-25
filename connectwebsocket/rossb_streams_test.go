@@ -94,3 +94,55 @@ func TestNoMaxStreamsKeepsUpstreamBehaviour(t *testing.T) {
 		raw.pingOn(101)
 	}
 }
+
+func TestIncreasingStreamIDsRejectsReuse(t *testing.T) {
+	wsURL := newServerWithOptions(t, testPingServer{}, connectwebsocket.WithIncreasingStreamIDs())
+	raw := dialRaw(t, wsURL)
+	raw.pingOn(5)
+	_ = raw.write(5, 0x06, pingHeaders) // same ID as a finished stream
+	raw.expectClose(websocket.StatusPolicyViolation)
+}
+
+func TestIncreasingStreamIDsRejectsLowerID(t *testing.T) {
+	wsURL := newServerWithOptions(t, testPingServer{}, connectwebsocket.WithIncreasingStreamIDs())
+	raw := dialRaw(t, wsURL)
+	raw.pingOn(5)
+	raw.pingOn(6) // one higher: allowed
+	raw.pingOn(9) // gaps are allowed
+	_ = raw.write(7, 0x06, pingHeaders)
+	raw.expectClose(websocket.StatusPolicyViolation)
+}
+
+func TestIncreasingStreamIDsRejectsZero(t *testing.T) {
+	wsURL := newServerWithOptions(t, testPingServer{}, connectwebsocket.WithIncreasingStreamIDs())
+	raw := dialRaw(t, wsURL)
+	_ = raw.write(0, 0x06, pingHeaders)
+	raw.expectClose(websocket.StatusPolicyViolation)
+}
+
+func TestIncreasingStreamIDsAcceptsMaxID(t *testing.T) {
+	wsURL := newServerWithOptions(t, testPingServer{}, connectwebsocket.WithIncreasingStreamIDs())
+	raw := dialRaw(t, wsURL)
+	raw.pingOn(1)
+	raw.pingOn(^uint32(0))
+}
+
+// The package's own transport allocates increasing IDs, so normal clients
+// keep working with the option on.
+func TestIncreasingStreamIDsWithTransport(t *testing.T) {
+	wsURL := newServerWithOptions(t, testPingServer{}, connectwebsocket.WithIncreasingStreamIDs())
+	for i := 0; i < 20; i++ {
+		if err := pingText(t, wsURL, 200); err != nil {
+			t.Fatalf("ping %d: %v", i, err)
+		}
+	}
+}
+
+// Without the option a finished ID can be reused, as upstream.
+func TestNoIncreasingStreamIDsKeepsUpstreamBehaviour(t *testing.T) {
+	wsURL := newServerWithOptions(t, testPingServer{})
+	raw := dialRaw(t, wsURL)
+	raw.pingOn(5)
+	raw.pingOn(5)
+	raw.pingOn(0)
+}

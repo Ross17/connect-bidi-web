@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: read limit (WithMaxFrameBytes),
-// stream cap (WithMaxStreams).
+// stream cap (WithMaxStreams), increasing IDs (WithIncreasingStreamIDs).
 
 package connectwebsocket
 
@@ -69,6 +69,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mc := newMuxConn(ctx, conn)
 	var handlers sync.WaitGroup
 	closeStatus := websocket.StatusNormalClosure
+	var highestID uint32 // highest stream ID started; 0 before the first
 	for {
 		streamID, flag, payload, err := readFrame(ctx, conn)
 		if err != nil {
@@ -80,6 +81,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if flag != bidiprotocol.FlagEnvelopeHeaders {
 				// A frame for a stream that already finished; drop it.
 				continue
+			}
+			if h.opts.increasingStreamIDs {
+				if streamID <= highestID {
+					slog.DebugContext(ctx, "bidi server: stream ID not increasing", "stream_id", streamID)
+					closeStatus = websocket.StatusPolicyViolation
+					break
+				}
+				highestID = streamID
 			}
 			if h.opts.maxStreams > 0 && mc.count() >= h.opts.maxStreams {
 				slog.DebugContext(ctx, "bidi server: stream limit reached", "limit", h.opts.maxStreams)

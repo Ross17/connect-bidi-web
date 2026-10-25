@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified by the RossB project, 2026: added WithMaxFrameBytes, WithMaxStreams.
+// Modified by the RossB project, 2026: added WithMaxFrameBytes, WithMaxStreams,
+// WithIncreasingStreamIDs.
 
 // Package connectwebsocket provides a connect.Transport and an http.Handler
 // that carry Connect RPCs over WebSocket connections, enabling full
@@ -57,6 +58,10 @@ type serverOptions struct {
 	// maxStreams bounds concurrent streams per connection; 0 or less keeps
 	// the upstream behaviour (no limit).
 	maxStreams int
+
+	// increasingStreamIDs requires each new stream ID to be greater than
+	// every earlier one on the connection.
+	increasingStreamIDs bool
 }
 
 type optionFunc func(*transportOptions, *serverOptions)
@@ -156,6 +161,21 @@ func WithMaxStreams(maxStreams int) Option {
 	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
 		if sopts != nil {
 			sopts.maxStreams = maxStreams
+		}
+	})
+}
+
+// WithIncreasingStreamIDs makes the handler enforce the wire rule that
+// stream IDs on a connection only increase and are never reused. Without
+// it, a finished stream's ID is forgotten and a later headers frame with
+// the same ID starts a new RPC. With it, a headers frame whose ID is not
+// greater than every ID seen before (including 0) closes the connection
+// with status 1008. The transport in this package already allocates IDs
+// this way. It applies to NewHandler only.
+func WithIncreasingStreamIDs() Option {
+	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
+		if sopts != nil {
+			sopts.increasingStreamIDs = true
 		}
 	})
 }
