@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: stream count for WithMaxStreams,
-// bounded delivery for WithDeliverTimeout.
+// bounded delivery for WithDeliverTimeout, 32-bit build fix.
 
 package connectwebsocket
 
@@ -144,7 +144,7 @@ func (mc *muxConn) newStream(ctx context.Context, dedicated bool) (*muxStream, e
 	if mc.closed {
 		return nil, mc.closeErr
 	}
-	for i := 0; i < math.MaxUint32; i++ {
+	for i := uint64(0); i < math.MaxUint32; i++ {
 		mc.nextID++
 		if mc.nextID == 0 {
 			mc.nextID = 1
