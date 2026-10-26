@@ -14,7 +14,8 @@
 //
 // Modified by the RossB project, 2026: read limit (WithMaxFrameBytes),
 // stream cap (WithMaxStreams), increasing IDs (WithIncreasingStreamIDs),
-// slow-consumer reset (WithDeliverTimeout), control stream (WithControlHandler).
+// slow-consumer reset (WithDeliverTimeout), control stream (WithControlHandler),
+// persistent streams (WithStreamOwner).
 
 package connectwebsocket
 
@@ -123,9 +124,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		stream.deliver(flag, payload)
 	}
-	mc.terminateAll(errConnClosed)
+	detached := mc.terminateAll(errConnClosed)
 	handlers.Wait()
 	_ = conn.Close(closeStatus, "")
+	// Hand the surviving streams back last, once this connection is done
+	// with them, so the owner can adopt them onto another one.
+	for _, stream := range detached {
+		h.opts.owner.DetachStream(&PersistentStream{stream: stream}, stream.wrapper)
+	}
 }
 
 // startStream registers a new stream and dispatches its RPC on its own
@@ -138,22 +144,62 @@ func (h *Handler) startStream(
 	handlers *sync.WaitGroup,
 	remoteAddr string,
 ) {
-	streamCtx, cancel := context.WithCancel(ctx)
-	stream := newMuxStream(streamCtx, mc, streamID)
-	stream.cancel = cancel
+	stream := newMuxStream(ctx, mc, streamID)
 	// The inbox always has room for the headers envelope on a fresh stream.
 	stream.deliver(bidiprotocol.FlagEnvelopeHeaders, headersPayload)
+
+	var conn bidiprotocol.Conn = stream
+	if h.opts.owner != nil {
+		if header, err := bidiprotocol.UnmarshalHeaders(headersPayload); err == nil {
+			streamValues, wrapped, persist := h.opts.owner.OpenStream(ctx, streamID, header, stream)
+			if wrapped != nil {
+				conn = wrapped
+				stream.wrapper = wrapped
+			}
+			if streamValues != nil {
+				ctx = streamValues
+			}
+			stream.persistent = persist
+		}
+		// A headers frame this package cannot parse is left to HandleRPC,
+		// which refuses it; the owner never sees such a stream.
+	}
+
+	// A persistent stream outlives this connection, so its context must not
+	// be canceled when the connection's is. Values (trace identifiers and
+	// the like) are kept.
+	parent := ctx
+	if stream.persistent {
+		parent = context.WithoutCancel(ctx)
+	}
+	streamCtx, cancel := context.WithCancel(parent)
+	stream.ctx = streamCtx
+	stream.cancel = cancel
+	// A fresh stream is attached. No caller can observe this before the
+	// connection ends, because the handle only reaches the owner at
+	// DetachStream, but it keeps the flag's meaning (the stream has a
+	// connection) true at all times.
+	stream.attached.Store(true)
+
 	if !mc.register(stream) {
 		cancel()
 		return
 	}
-	handlers.Add(1)
+	if !stream.persistent {
+		handlers.Add(1)
+	}
 	go func() {
-		defer handlers.Done()
-		defer mc.deregister(streamID)
+		if !stream.persistent {
+			defer handlers.Done()
+		}
+		defer func() {
+			if live := stream.conn(); live != nil {
+				live.deregister(stream.id)
+			}
+		}()
 		// Terminating unblocks the read loop if it is delivering a frame to
 		// this stream, and cancels streamCtx.
 		defer stream.terminate(errStreamClosed)
-		bidiprotocol.HandleRPC(streamCtx, stream, h.server, h.opts.Options, "websocket", remoteAddr)
+		bidiprotocol.HandleRPC(streamCtx, conn, h.server, h.opts.Options, "websocket", remoteAddr)
 	}()
 }

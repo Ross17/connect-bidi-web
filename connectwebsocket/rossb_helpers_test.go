@@ -17,6 +17,7 @@ package connectwebsocket_test
 import (
 	"context"
 	"encoding/binary"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -39,6 +40,23 @@ func newServerWithOptions(t *testing.T, impl pingv1connect.PingServiceHandler, o
 	})}, opts...)
 	wsHandler := connectwebsocket.NewHandler(connectServer, all...)
 	server := httptest.NewServer(wsHandler)
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http")
+}
+
+// newServerWithHandlerWrapper is newServerWithOptions with the handler
+// wrapped, so a test can observe when ServeHTTP returns.
+func newServerWithHandlerWrapper(t *testing.T, impl pingv1connect.PingServiceHandler, wrap func(http.Handler, http.ResponseWriter, *http.Request), opts ...connectwebsocket.Option) string {
+	t.Helper()
+	connectServer := connect.NewServer()
+	pingv1connect.RegisterPingServiceHandler(connectServer, impl)
+	all := append([]connectwebsocket.Option{connectwebsocket.WithAcceptOptions(&websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})}, opts...)
+	wsHandler := connectwebsocket.NewHandler(connectServer, all...)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wrap(wsHandler, w, r)
+	}))
 	t.Cleanup(server.Close)
 	return "ws" + strings.TrimPrefix(server.URL, "http")
 }

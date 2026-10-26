@@ -13,7 +13,8 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: stream count for WithMaxStreams,
-// bounded delivery for WithDeliverTimeout, 32-bit build fix, control stream.
+// bounded delivery for WithDeliverTimeout, 32-bit build fix, control stream,
+// streams that outlive their connection (WithStreamOwner).
 
 package connectwebsocket
 
@@ -57,6 +58,13 @@ const (
 var (
 	errConnClosed   = errors.New("websocket connection closed")
 	errStreamClosed = errors.New("websocket stream closed")
+	// ErrDetached is returned by a write on a persistent stream that has no
+	// connection: the socket is gone and no new one has adopted it yet.
+	ErrDetached = errors.New("connectwebsocket: stream detached")
+	// errStreamExpired ends a persistent stream whose owner gave up on it.
+	errStreamExpired = errors.New("connectwebsocket: stream expired")
+	// errAdoptRefused is returned by ControlStream.Adopt.
+	errAdoptRefused = errors.New("connectwebsocket: stream cannot be adopted")
 	// errDeliverTimeout ends a stream whose consumer stopped reading.
 	errDeliverTimeout = connect.NewError(connect.CodeResourceExhausted, "websocket stream consumer too slow")
 )
@@ -198,6 +206,13 @@ func (mc *muxConn) lookup(streamID uint32) *muxStream {
 	return mc.streams[streamID]
 }
 
+// conn returns the connection the stream is attached to, or nil.
+func (s *muxStream) conn() *muxConn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.mc
+}
+
 func (mc *muxConn) writeFrame(streamID uint32, flag uint8, payload []byte) error {
 	mc.writeMu.Lock()
 	defer mc.writeMu.Unlock()
@@ -207,6 +222,23 @@ func (mc *muxConn) writeFrame(streamID uint32, flag uint8, payload []byte) error
 // controlStream is the ControlStream handed to a ControlHandler. It holds
 // only the connection, so it stays valid for the connection's lifetime.
 type controlStream struct{ mc *muxConn }
+
+// Adopt implements ControlStream.
+func (c controlStream) Adopt(stream *PersistentStream) error {
+	if stream == nil || stream.stream == nil {
+		return errAdoptRefused
+	}
+	c.mc.mu.Lock()
+	closed, closeErr := c.mc.closed, c.mc.closeErr
+	c.mc.mu.Unlock()
+	if closed {
+		return closeErr
+	}
+	if !stream.stream.adopt(c.mc) {
+		return errAdoptRefused
+	}
+	return nil
+}
 
 // Send implements ControlStream.
 func (c controlStream) Send(flag uint8, payload []byte) error {
@@ -243,27 +275,38 @@ func (mc *muxConn) readLoopClient(ctx context.Context) {
 	}
 }
 
-// terminateAll marks the connection closed and terminates every stream.
-func (mc *muxConn) terminateAll(err error) {
+// terminateAll marks the connection closed and terminates every stream. A
+// persistent stream is detached instead: it is removed from the connection
+// and returned, still running, for its owner to re-attach or expire.
+func (mc *muxConn) terminateAll(err error) []*muxStream {
 	mc.mu.Lock()
 	if !mc.closed {
 		mc.closed = true
 		mc.closeErr = err
 	}
 	streams := make([]*muxStream, 0, len(mc.streams))
+	detached := make([]*muxStream, 0)
 	for _, stream := range mc.streams {
+		if stream.persistent {
+			detached = append(detached, stream)
+			continue
+		}
 		streams = append(streams, stream)
 	}
 	clear(mc.streams)
 	mc.mu.Unlock()
+	for _, stream := range detached {
+		stream.detach()
+	}
 	for _, stream := range streams {
 		stream.terminate(err)
 	}
+	return detached
 }
 
 // shutdown terminates every stream and closes the connection gracefully.
 func (mc *muxConn) shutdown() error {
-	mc.terminateAll(errConnClosed)
+	_ = mc.terminateAll(errConnClosed)
 	return mc.conn.Close(websocket.StatusNormalClosure, "")
 }
 
@@ -294,7 +337,11 @@ type envelope struct {
 // frames to inbox; writes go back through the shared connection with this
 // stream's ID.
 type muxStream struct {
-	mc  *muxConn
+	// connMu guards mc, which changes when a persistent stream is adopted
+	// by another connection.
+	connMu sync.Mutex
+	mc     *muxConn
+
 	id  uint32
 	ctx context.Context //nolint:containedctx // carries the RPC context into bidiprotocol.Conn's context-free interface
 
@@ -313,6 +360,15 @@ type muxStream struct {
 	// rxEnd records that the peer finished this stream with an end-stream
 	// envelope, making a reset frame on close unnecessary.
 	rxEnd atomic.Bool
+
+	// persistent marks a stream that the connection's end detaches instead
+	// of terminating; see WithStreamOwner.
+	persistent bool
+	// wrapper is what the owner returned from OpenStream, handed back to it
+	// at DetachStream so it can recognise the stream.
+	wrapper StreamConn
+	// attached is false while a persistent stream has no connection.
+	attached atomic.Bool
 }
 
 var _ bidiprotocol.Conn = (*muxStream)(nil)
@@ -360,6 +416,41 @@ func (s *muxStream) deliverWithin(flag uint8, payload []byte, d time.Duration) b
 	case <-timer.C:
 		return false
 	}
+}
+
+// detach unhooks a persistent stream from its connection. The handler keeps
+// running: its context is not canceled and its inbox is kept, so frames that
+// arrived before the drop are still delivered. Writes fail until the stream
+// is adopted again.
+func (s *muxStream) detach() {
+	s.connMu.Lock()
+	s.mc = nil
+	s.connMu.Unlock()
+	s.attached.Store(false)
+}
+
+// adopt attaches a detached persistent stream to mc under its own ID. It
+// reports false if the stream has ended, is still attached, or the ID is
+// taken on mc.
+func (s *muxStream) adopt(mc *muxConn) bool {
+	select {
+	case <-s.terminated:
+		return false
+	default:
+	}
+	s.connMu.Lock()
+	if s.mc != nil {
+		s.connMu.Unlock()
+		return false
+	}
+	if !mc.register(s) {
+		s.connMu.Unlock()
+		return false
+	}
+	s.mc = mc
+	s.connMu.Unlock()
+	s.attached.Store(true)
+	return true
 }
 
 // terminate ends the stream with err as the terminal error for both
@@ -411,7 +502,14 @@ func (s *muxStream) WriteEnvelope(flag uint8, payload []byte) error {
 		return s.ctx.Err()
 	default:
 	}
-	return s.mc.writeFrame(s.id, flag, payload)
+	mc := s.conn()
+	if mc == nil {
+		// A persistent stream with no connection. The owner decides what to
+		// do with frames written while detached; this package does not hold
+		// them.
+		return ErrDetached
+	}
+	return mc.writeFrame(s.id, flag, payload)
 }
 
 // CloseSend implements bidiprotocol.Conn by writing an explicit end-stream
@@ -424,14 +522,19 @@ func (s *muxStream) CloseSend() error {
 // stream. If the peer hasn't finished the stream, a reset frame tells it to
 // stop work; a dedicated connection is closed outright instead.
 func (s *muxStream) Close() error {
-	s.mc.deregister(s.id)
+	mc := s.conn()
+	if mc == nil {
+		s.terminate(errStreamClosed)
+		return nil
+	}
+	mc.deregister(s.id)
 	finished := s.rxEnd.Load()
 	s.terminate(errStreamClosed)
 	if s.dedicated {
-		return s.mc.conn.Close(websocket.StatusNormalClosure, "")
+		return mc.conn.Close(websocket.StatusNormalClosure, "")
 	}
 	if !finished {
-		_ = s.mc.writeFrame(s.id, bidiprotocol.FlagEnvelopeReset, nil)
+		_ = mc.writeFrame(s.id, bidiprotocol.FlagEnvelopeReset, nil)
 	}
 	return nil
 }

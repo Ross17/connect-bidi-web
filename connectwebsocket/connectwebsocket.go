@@ -13,7 +13,8 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: added WithMaxFrameBytes, WithMaxStreams,
-// WithIncreasingStreamIDs, WithDeliverTimeout, WithControlHandler.
+// WithIncreasingStreamIDs, WithDeliverTimeout, WithControlHandler,
+// WithStreamOwner.
 
 // Package connectwebsocket provides a connect.Transport and an http.Handler
 // that carry Connect RPCs over WebSocket connections, enabling full
@@ -26,6 +27,7 @@ package connectwebsocket
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"time"
 
@@ -71,6 +73,9 @@ type serverOptions struct {
 	// control, when set, receives every frame on stream 0 instead of
 	// letting it open an RPC.
 	control ControlHandler
+
+	// owner, when set, may wrap each stream and keep it across connections.
+	owner StreamOwner
 }
 
 type optionFunc func(*transportOptions, *serverOptions)
@@ -212,6 +217,16 @@ func WithDeliverTimeout(d time.Duration) Option {
 type ControlStream interface {
 	// Send writes one frame on the control stream.
 	Send(flag uint8, payload []byte) error
+
+	// Adopt attaches a detached persistent stream to this connection under
+	// its own stream ID, so frames for that ID are delivered to it again and
+	// its writes go to this socket. It fails if the stream has ended, is
+	// still attached to a connection, or its ID is already in use here.
+	//
+	// Adopting a stream is what lets a resumable session continue on a new
+	// socket. This package does not check who may adopt what: the caller
+	// must only offer streams that belong to the peer it has authenticated.
+	Adopt(stream *PersistentStream) error
 }
 
 // ControlHandler receives the frames of one connection's control stream.
@@ -238,6 +253,100 @@ func WithControlHandler(handler ControlHandler) Option {
 	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
 		if sopts != nil {
 			sopts.control = handler
+		}
+	})
+}
+
+// StreamConn is one stream's end of the connection, as the RPC sees it. It
+// is the interface a StreamOwner wraps.
+//
+// Envelopes are read and written whole. ReadEnvelope blocks until a frame
+// arrives or the stream ends; WriteEnvelope sends one frame on this stream.
+// The methods are called from the RPC's own goroutine and are not safe for
+// concurrent use by several callers.
+type StreamConn interface {
+	// ReadEnvelope reads the next envelope.
+	ReadEnvelope() (flag uint8, payload []byte, err error)
+	// WriteEnvelope writes a single envelope.
+	WriteEnvelope(flag uint8, payload []byte) error
+	// CloseSend signals that no further envelopes will be written.
+	CloseSend() error
+	// Close releases the stream.
+	Close() error
+}
+
+// PersistentStream is a stream that outlives the connection it opened on.
+// Its handler keeps running after the socket is gone, so its owner must
+// eventually adopt it onto another connection or expire it; otherwise the
+// handler runs until it finishes by itself.
+type PersistentStream struct {
+	stream *muxStream
+}
+
+// ID returns the stream ID the stream was opened with. A stream keeps its ID
+// when it moves to another connection.
+func (p *PersistentStream) ID() uint32 { return p.stream.id }
+
+// Attached reports whether the stream currently has a connection.
+func (p *PersistentStream) Attached() bool { return p.stream.attached.Load() }
+
+// Expire ends the stream: the handler's context is canceled with err as the
+// cause and its next read or write fails. Calling it more than once, or on a
+// stream that already ended, does nothing.
+func (p *PersistentStream) Expire(err error) {
+	if err == nil {
+		err = errStreamExpired
+	}
+	p.stream.terminate(err)
+}
+
+// StreamOwner keeps streams across connections. It is how a resumable layer
+// is built on top of this package: the owner wraps each stream it cares
+// about, so it sees every frame that stream sends and receives, and takes
+// the stream back when the socket drops.
+type StreamOwner interface {
+	// OpenStream is called for each new stream, from the connection's read
+	// loop, once its headers frame has been read and before the RPC starts.
+	// header is the request metadata; conn is the stream as the RPC would
+	// otherwise see it.
+	//
+	// Return conn and false to leave the stream exactly as it is without an
+	// owner. Return a wrapper to observe or hold the stream's frames, and
+	// true to make it persistent: the connection ending detaches it instead
+	// of canceling it, and DetachStream is called with the handle.
+	//
+	// The returned context becomes the parent of the RPC's context, so an
+	// owner can carry per-stream values into the handler. Returning nil
+	// keeps ctx. Cancelling it does not end the stream; use
+	// PersistentStream.Expire for that, and note that a persistent stream's
+	// context is detached from the connection's, so values are kept but
+	// cancellation is not inherited.
+	//
+	// It must return promptly: while it runs, no other stream on that
+	// connection is read.
+	OpenStream(ctx context.Context, id uint32, header http.Header, conn StreamConn) (context.Context, StreamConn, bool)
+
+	// DetachStream is called once for each persistent stream still running
+	// when its connection ends. conn is exactly what OpenStream returned
+	// for that stream, so an owner can recognise its own object: stream IDs
+	// are chosen per connection and repeat across them, so the ID alone
+	// does not identify a stream. Until the owner adopts the stream onto
+	// another connection, the stream's writes fail with ErrDetached. The
+	// owner is responsible for expiring streams it will not adopt.
+	DetachStream(stream *PersistentStream, conn StreamConn)
+}
+
+// WithStreamOwner installs owner, which may wrap each stream and keep
+// persistent streams across connections. Without it, a stream belongs to its
+// connection and ends with it, which is the upstream behaviour.
+//
+// A persistent stream is not waited for when its connection closes, so the
+// HTTP handler returns while the stream's RPC is still running. The owner
+// must bound how long that can last. It applies to NewHandler only.
+func WithStreamOwner(owner StreamOwner) Option {
+	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
+		if sopts != nil {
+			sopts.owner = owner
 		}
 	})
 }
