@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: stream count for WithMaxStreams,
-// bounded delivery for WithDeliverTimeout, 32-bit build fix.
+// bounded delivery for WithDeliverTimeout, 32-bit build fix, control stream.
 
 package connectwebsocket
 
@@ -43,6 +43,11 @@ import (
 // client, start at 1, increase by one per stream, and are never reused
 // within a connection. Everything after the stream ID is a standard Connect
 // envelope.
+
+// ControlStreamID is the stream ID reserved for the control stream by
+// WithControlHandler. The transport in this package never allocates it: its
+// own stream IDs start at 1.
+const ControlStreamID uint32 = 0
 
 const (
 	streamIDLen  = 4
@@ -197,6 +202,21 @@ func (mc *muxConn) writeFrame(streamID uint32, flag uint8, payload []byte) error
 	mc.writeMu.Lock()
 	defer mc.writeMu.Unlock()
 	return writeFrame(mc.writeCtx, mc.conn, streamID, flag, payload)
+}
+
+// controlStream is the ControlStream handed to a ControlHandler. It holds
+// only the connection, so it stays valid for the connection's lifetime.
+type controlStream struct{ mc *muxConn }
+
+// Send implements ControlStream.
+func (c controlStream) Send(flag uint8, payload []byte) error {
+	c.mc.mu.Lock()
+	closed, closeErr := c.mc.closed, c.mc.closeErr
+	c.mc.mu.Unlock()
+	if closed {
+		return closeErr
+	}
+	return c.mc.writeFrame(ControlStreamID, flag, payload)
 }
 
 // readLoopClient routes incoming frames to the client streams that opened

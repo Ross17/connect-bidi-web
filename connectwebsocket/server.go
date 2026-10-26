@@ -14,7 +14,7 @@
 //
 // Modified by the RossB project, 2026: read limit (WithMaxFrameBytes),
 // stream cap (WithMaxStreams), increasing IDs (WithIncreasingStreamIDs),
-// slow-consumer reset (WithDeliverTimeout).
+// slow-consumer reset (WithDeliverTimeout), control stream (WithControlHandler).
 
 package connectwebsocket
 
@@ -76,6 +76,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			slog.DebugContext(ctx, "bidi server: websocket read ended", "error", err)
 			break
+		}
+		if h.opts.control != nil && streamID == ControlStreamID {
+			if err := h.opts.control.HandleControl(ctx, controlStream{mc: mc}, flag, payload); err != nil {
+				slog.DebugContext(ctx, "bidi server: control handler refused a frame", "error", err)
+				closeStatus = websocket.StatusPolicyViolation
+				break
+			}
+			continue
 		}
 		stream := mc.lookup(streamID)
 		if stream == nil {

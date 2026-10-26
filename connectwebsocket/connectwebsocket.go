@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by the RossB project, 2026: added WithMaxFrameBytes, WithMaxStreams,
-// WithIncreasingStreamIDs, WithDeliverTimeout.
+// WithIncreasingStreamIDs, WithDeliverTimeout, WithControlHandler.
 
 // Package connectwebsocket provides a connect.Transport and an http.Handler
 // that carry Connect RPCs over WebSocket connections, enabling full
@@ -67,6 +67,10 @@ type serverOptions struct {
 	// deliverTimeout bounds how long the read loop waits for one stream's
 	// consumer; 0 or less keeps the upstream behaviour (wait forever).
 	deliverTimeout time.Duration
+
+	// control, when set, receives every frame on stream 0 instead of
+	// letting it open an RPC.
+	control ControlHandler
 }
 
 type optionFunc func(*transportOptions, *serverOptions)
@@ -198,6 +202,42 @@ func WithDeliverTimeout(d time.Duration) Option {
 	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
 		if sopts != nil {
 			sopts.deliverTimeout = d
+		}
+	})
+}
+
+// ControlStream writes frames on the control stream. It is safe for
+// concurrent use and may be kept for as long as the connection lives; a write
+// after the connection ends returns an error.
+type ControlStream interface {
+	// Send writes one frame on the control stream.
+	Send(flag uint8, payload []byte) error
+}
+
+// ControlHandler receives the frames of one connection's control stream.
+//
+// HandleControl is called from the connection's read loop, once per frame, in
+// arrival order and never concurrently for the same connection, so it must
+// return promptly: while it runs, no other stream on that connection is read.
+// It must not retain payload after returning. Returning an error is a
+// protocol violation: the connection closes with status 1008 and no further
+// frames are read.
+type ControlHandler interface {
+	HandleControl(ctx context.Context, stream ControlStream, flag uint8, payload []byte) error
+}
+
+// WithControlHandler reserves stream 0 as a control stream and sends its
+// frames to handler. Without it, stream 0 is an ordinary stream ID on which a
+// headers frame opens an RPC, which is the upstream behaviour.
+//
+// A control stream gives an extension somewhere to put its own messages
+// without a flag of its own and without disturbing RPC streams. Frames on
+// stream 0 are never counted against WithMaxStreams and never checked by
+// WithIncreasingStreamIDs. It applies to NewHandler only.
+func WithControlHandler(handler ControlHandler) Option {
+	return optionFunc(func(_ *transportOptions, sopts *serverOptions) {
+		if sopts != nil {
+			sopts.control = handler
 		}
 	})
 }
